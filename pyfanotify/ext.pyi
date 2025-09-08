@@ -141,7 +141,20 @@ def run(ctx: int, rcon: Connection, log_fd: int = None, fn: Callable = None, fn_
     """
     return
 
-# def response(fd: int, response: int) -> bytes: ...
+def response(ctx: int, fanotify_fd: int, event_fd: int, response: int, log_fd: int = -1) -> None:
+    """
+    Send response to a permission event.
+    
+    Args:
+        fanotify_fd (int): Fanotify file descriptor (from fanotify_init)
+        event_fd (int): File descriptor from the permission event
+        response (int): Response to send (FAN_ALLOW, FAN_DENY, or FAN_AUDIT)
+    
+    Raises:
+        OSError: if write fails
+        ValueError: if invalid response value
+    """
+    ...
 
 
 class FanoRule:

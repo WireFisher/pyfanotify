@@ -18,6 +18,7 @@
 #include <sys/un.h>
 #include <sys/vfs.h>
 #include <unistd.h>
+#include <dirent.h>
 
 
 #define FUNUSED __attribute__((unused))
@@ -467,6 +468,8 @@ PyDoc_STRVAR(init__doc__,
 "Raises:\n"
 "    OSError: Raised when fanotify_init sets errno\n");
 
+static void do_log(fano_ctx_t *ctx, const char *fmt, ...);
+
 static PyObject *
 pyfanotify_init(PyObject *self, PyObject *args, PyObject *kwargs)
 {
@@ -576,6 +579,32 @@ do_log(fano_ctx_t *ctx, const char *fmt, ...)
     do_write(ctx->log_fd, &msg, len + hdr_len);
 }
 
+static void
+send_permission_response(fano_ctx_t *ctx, struct fanotify_event_metadata *ev)
+{
+    // Check if this is a permission event that requires a response
+    if (ev->mask & (FAN_OPEN_PERM | FAN_ACCESS_PERM
+#ifdef FAN_OPEN_EXEC_PERM
+                    | FAN_OPEN_EXEC_PERM
+#endif
+                   )) {
+        struct fanotify_response response = {
+            .fd = ev->fd,
+            .response = FAN_ALLOW
+        };
+        
+        ssize_t ret = write(ctx->fano_fd, &response, sizeof(response));
+        if (ret == -1) {
+            do_log(ctx, "Failed to send FAN_ALLOW response for fd %d: %s", ev->fd, strerror(errno));
+        } else if (ret != sizeof(response)) {
+            do_log(ctx, "Partial write when sending FAN_ALLOW response for fd %d", ev->fd);
+        } else {
+            do_log(ctx, "Sent FAN_ALLOW response for skipped permission event (fd %d, mask 0x%llx)", 
+                   ev->fd, (unsigned long long)ev->mask);
+        }
+    }
+}
+
 static ssize_t
 get_proc_str(const char *fmt, int meta, char *buf, size_t buf_size)
 {
@@ -674,9 +703,11 @@ handle_events(fano_ctx_t *ctx)
             goto end;
         }
 
-        if (pid_cache_check(ctx, &bb, ev->pid)->our)
-            // skip ours
+        if (pid_cache_check(ctx, &bb, ev->pid)->our) {
+            // skip ours - but send permission response if needed
+            send_permission_response(ctx, ev);
             continue;
+        }
 
         int fnames = 0;
         str_val_t exe[1], cwd[1], path[2], evt;
@@ -781,8 +812,10 @@ handle_events(fano_ctx_t *ctx)
             } else
                 cont = 1;
         fid_end:
-            if (cont)
+            if (cont) {
+                send_permission_response(ctx, ev);
                 continue;
+            }
         }
 # undef FAN_FLAGS
 #endif // FAN_REPORT_FID
@@ -800,8 +833,10 @@ handle_events(fano_ctx_t *ctx)
                     || RULE_MATCH(exe, "/proc/%ld/exe", pid, 0)
                     || RULE_MATCH(cwd, "/proc/%ld/cwd", pid, 0)
                     || RULE_MATCH(path, "/proc/self/fd/%ld", fd, 0)
-                    || RULE_MATCH(path, "/proc/self/fd/%ld", fd, 1))
+                    || RULE_MATCH(path, "/proc/self/fd/%ld", fd, 1)) {
+                send_permission_response(ctx, ev);
                 continue;
+            }
 # undef RULE_MATCH
 
             // sending data
@@ -1062,15 +1097,71 @@ end:
     }
 }
 
-//PyDoc_STRVAR(response__doc__,
-//"response(fd: int, response: int) -> bytes\n"
-//"\n");
-//
-//static PyObject *
-//Py(PyObject *self, PyObject *args, PyObject *kwargs)
-//{
-//    Py_RETURN_NONE;
-//}
+PyDoc_STRVAR(response__doc__,
+"response(ctx: int, fanotify_fd: int, event_fd: int, response: int[, log_fd: int]) -> None\n"
+"\n"
+"Send response to a permission event.\n"
+"\n"
+"Args:\n"
+"    ctx (int): Fanotify context\n"
+"    fanotify_fd (int): Fanotify file descriptor (from fanotify_init)\n"
+"    event_fd (int): File descriptor from the permission event\n"
+"    response (int): Response to send (FAN_ALLOW, FAN_DENY, or FAN_AUDIT)\n"
+"    log_fd (int): Optional\n"
+"\n"
+"Raises:\n"
+"    OSError: if write fails\n"
+"    ValueError: if invalid response value\n");
+
+static PyObject *
+pyfanotify_response(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    static char *kwlist[] = {"ctx", "fanotify_fd", "event_fd", "response", "log_fd", NULL};
+    long long ctx_ptr;
+    int fanotify_fd, event_fd, log_fd = -1;
+    unsigned int response;
+    fano_ctx_t *ctx;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "LiiI|i:response", kwlist,
+                                     &ctx_ptr, &fanotify_fd, &event_fd, &response, &log_fd))
+        return NULL;
+
+    if (!(ctx = (void *)ctx_ptr)) {
+        PyErr_SetString(PyExc_ValueError, "Invalid context");
+        return NULL;
+    }
+
+    ctx->log_fd = log_fd;
+
+    // Validate response value
+    if (response != FAN_ALLOW && response != FAN_DENY && response != FAN_AUDIT) {
+        PyErr_Format(PyExc_ValueError, 
+                     "Invalid response: %u. Must be FAN_ALLOW (%u), FAN_DENY (%u), or FAN_AUDIT (%u)",
+                     response, FAN_ALLOW, FAN_DENY, FAN_AUDIT);
+        return NULL;
+    }
+
+    // Create the fanotify_response structure
+    struct fanotify_response fan_response = {
+        .fd = event_fd,
+        .response = response
+    };
+
+    do_log(ctx, "DEBUG: response write to %d\n", fanotify_fd);
+
+    // Send response to the fanotify file descriptor
+    ssize_t ret = write(fanotify_fd, &fan_response, sizeof(fan_response));
+    if (ret == -1) {
+        return PyErr_SetFromErrno(PyExc_OSError);
+    }
+    if (ret != sizeof(fan_response)) {
+        PyErr_Format(PyExc_OSError, "Partial write: wrote %zd bytes, expected %zu", 
+                     ret, sizeof(fan_response));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
 
 
 static PyMethodDef ext_methods[] = {
@@ -1078,7 +1169,7 @@ static PyMethodDef ext_methods[] = {
         {"init", (PyCFunction)pyfanotify_init, METH_VARARGS | METH_KEYWORDS, init__doc__},
         {"mark", (PyCFunction)pyfanotify_mark, METH_VARARGS | METH_KEYWORDS, mark__doc__},
         {"run", (PyCFunction)pyfanotify_run, METH_VARARGS | METH_KEYWORDS, run__doc__},
-//        {"response", (PyCFunction)pyfanotify_response, METH_VARARGS | METH_KEYWORDS, response__doc__},
+        {"response", (PyCFunction)pyfanotify_response, METH_VARARGS | METH_KEYWORDS, response__doc__},
         {NULL, NULL, 0, NULL}
 };
 

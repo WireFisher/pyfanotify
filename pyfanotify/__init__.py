@@ -1,6 +1,6 @@
 # coding: utf-8
 
-__all__ = '__version__', 'Fanotify', 'FanotifyClient', 'FanoRule'
+__all__ = '__version__', 'Fanotify', 'FanotifyClient', 'FanoRule', 'response'
 
 import array
 import atexit
@@ -176,9 +176,11 @@ class Fanotify(mp.Process):
         if init_fid:
             flags &= ~FAN_CLASS_CONTENT
             flags |= _INIT_FID_FLAGS
+            # BUG: needs support for PERM events
 
         try:
             self._fd = ext.init(self._ctx, flags, _INIT_O_FLAGS)
+            print(f"fano_fd: {self._fd}")
         except OSError as e:
             e.strerror = 'Fanotify init: %s' % e.strerror
             self._exception(str(e))
@@ -285,10 +287,12 @@ class Fanotify(mp.Process):
         :param dirfd: used with `path`. see man
         """
 
+        # Check for permission events with FID reporting (not supported)
         if ev_types & (FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM):
-            msg = 'PERM events are not supported yet'
-            self._error(msg)
-            raise NotImplementedError(msg)
+            if self.with_fid:
+                msg = 'PERM events are not allowed with FID report (init_fid=True)'
+                self._error(msg)
+                raise ValueError(msg)
 
         if isinstance(path, str):
             flags = (remove and FAN_MARK_REMOVE) or FAN_MARK_ADD
@@ -353,6 +357,9 @@ class Fanotify(mp.Process):
             if e.errno == errno.EBADF:
                 msg += ': fd=%s is not an fanotify descriptor' % self._fd
             self._exception(msg)
+
+    def response(self, event_fd: int, response: int) -> None:
+        return ext.response(self._ctx, self._fd, event_fd, response, sys.stdout.fileno())
 
     def _close(self) -> None:
         self._rd.close()
@@ -457,6 +464,9 @@ class FanotifyClient:
         s.bind(b'\0' + self.rname)
         self.sock = s
         self.fanotify.connect(self.rule)
+
+    def response(self, event_fd: int, response: int) -> None:
+        return self.fanotify.response(event_fd, response)
 
     def close(self) -> None:
         """
