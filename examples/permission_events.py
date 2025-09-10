@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
-"""
-Example demonstrating permission events (FAN_OPEN_PERM, FAN_ACCESS_PERM, FAN_OPEN_EXEC_PERM).
-
-This example shows how to:
-1. Monitor permission events on a directory
-2. Receive permission events that require a response
-3. Send appropriate responses (FAN_ALLOW/FAN_DENY) to allow or deny operations
-
-Note: This requires root privileges to use permission events.
-"""
-
 import select
 import sys
 import os
 import time
 
 import pyfanotify as fan
+import multiprocessing as mp
 
 
-def main():
+def run():
     if os.geteuid() != 0:
         print("Error: Permission events require root privileges")
         sys.exit(1)
 
     # Create a test directory
-    test_dir = "/tmp/test_fno"
-    os.mkdir(test_dir)
+    test_dir = "/home"
     
     print(f"Monitoring permission events on: {test_dir}")
     print("Try accessing files in this directory from another terminal")
@@ -36,37 +25,32 @@ def main():
     
     # Mark the test directory for permission events
     # We'll monitor open and access permission events
-    #perm_events = fan.FAN_OPEN_PERM | fan.FAN_ACCESS_PERM | fan.FAN_OPEN_EXEC_PERM
-    #perm_events = fan.FAN_ACCESS_PERM
-    perm_events = fan.FAN_OPEN| fan.FAN_ACCESS
-    print("1")
+    perm_events = fan.FAN_OPEN_PERM | fan.FAN_ACCESS_PERM | fan.FAN_OPEN_EXEC_PERM
     fanot.mark(test_dir, ev_types=perm_events, is_type='fs')
-    print("2")
     fanot.start()
-    print("3")
 
     # Create a client to receive events
     # pass_fd=True is required to get file descriptors for permission responses
     cli = fan.FanotifyClient(fanot, path_pattern='*', pass_fd=True)
-    print("4")
     
     poll = select.poll()
-    print("5")
     poll.register(cli.sock.fileno(), select.POLLIN)
-    print("6")
     
     try:
         while poll.poll():
-            print("7")
             for event in cli.get_events():
-                print(event)
                 event_str = fan.evt_to_str(event.ev_types)
-                path = event.path[0].decode() if event.path else "unknown"
+                # Get path from file descriptor instead of event struct
+                try:
+                    path = os.readlink(f"/proc/self/fd/{event.fd}")
+                except (OSError, FileNotFoundError):
+                    path = "unknown"
                 
                 print(f"Permission event: {event_str}")
                 print(f"  PID: {event.pid}")
                 print(f"  Path: {path}")
                 print(f"  FD: {event.fd}")
+                print(f"  Original FD: {event.original_fd}")
                 
                 # Decide whether to allow or deny the operation
                 # For this example, we'll allow all operations
@@ -76,7 +60,7 @@ def main():
                 if event.ev_types & fan.FAN_ALL_PERM_EVENTS:
                     try:
                         # Send response to allow the operation
-                        cli.response(event.fd, response_action)
+                        cli.response(event.original_fd, response_action)
                         print(f"  Response: ALLOWED")
                     except Exception as e:
                         print(f"  Error sending response: {e}")
@@ -91,13 +75,38 @@ def main():
     finally:
         cli.close()
         fanot.stop()
+
+def run_monitor_in_seperate_process():
+    """
+    We need to run the monitor in a seperate process to avoid deadlock.
+    """
+    process = None
+    try:
+        process = mp.Process(target=run, args=())
+        process.start()
         
-        # Clean up test directory
+        # Give it time to start
+        time.sleep(2)
+        
+        if process.is_alive():
+            process.join(timeout=None)
+            
+            if process.exitcode == 0:
+                print("✓ Separate process approach worked!")
+            else:
+                print(f"✗ Process failed with exit code: {process.exitcode}")
+        else:
+            print("✗ Monitoring process failed to start")
+            
+    except Exception as e:
+        print(f"✗ Error: {e}")
+    finally:
         try:
-            os.rmdir(test_dir)
-        except OSError:
+            if process and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        except:
             pass
 
-
 if __name__ == '__main__':
-    main()
+    run_monitor_in_seperate_process()

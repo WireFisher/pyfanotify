@@ -109,6 +109,7 @@ _INIT_O_FLAGS = os.O_RDONLY | os.O_LARGEFILE | ext.O_CLOEXEC | os.O_NOATIME
 _CMD_STOP = ext.CMD_STOP
 _CMD_CONNECT = ext.CMD_CONNECT
 _CMD_DISCONNECT = ext.CMD_DISCONNECT
+_CMD_CLOSE_FD = ext.CMD_CLOSE_FD
 
 _EVT_MASKS = {
     FAN_ACCESS: 'access',
@@ -180,7 +181,6 @@ class Fanotify(mp.Process):
 
         try:
             self._fd = ext.init(self._ctx, flags, _INIT_O_FLAGS)
-            print(f"fano_fd: {self._fd}")
         except OSError as e:
             e.strerror = 'Fanotify init: %s' % e.strerror
             self._exception(str(e))
@@ -256,6 +256,18 @@ class Fanotify(mp.Process):
         if not isinstance(rule, FanoRule):
             raise TypeError('Got %s, FanoRule expected' % type(rule).__name__)
         self._wr.send((_CMD_DISCONNECT, rule))
+
+    def close_fd(self, fd: int) -> None:
+        """
+        Close a file descriptor that was received from a fanotify event
+        
+        :param fd: File descriptor to close
+        :raises TypeError: if fd is not an integer
+        """
+        
+        if not isinstance(fd, int):
+            raise TypeError('Got %s, int expected' % type(fd).__name__)
+        self._wr.send((_CMD_CLOSE_FD, fd))
 
     def mark(self, path: Union[str, Iterable], ev_types: int = FAN_ALL_EVENTS,
              is_type: str = '', dont_follow: bool = False,
@@ -467,7 +479,11 @@ class FanotifyClient:
         self.fanotify.connect(self.rule)
 
     def response(self, event_fd: int, response: int) -> None:
-        return self.fanotify.response(event_fd, response)
+        """
+        NOTE: event_fd will be closed automatically after the response.
+        """
+        self.fanotify.response(event_fd, response)
+        self.fanotify.close_fd(event_fd)
 
     def close(self) -> None:
         """

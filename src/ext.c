@@ -32,6 +32,7 @@ PyDoc_STRVAR(ext__doc__,
 #define CMD_STOP 0
 #define CMD_CONNECT 1
 #define CMD_DISCONNECT 2
+#define CMD_CLOSE_FD 3
 
 #if (EAGAIN == EWOULDBLOCK)
 #define AGAIN (errno == EAGAIN)
@@ -55,11 +56,17 @@ typedef struct {
     char our;
 } pid_cache_t;
 
+typedef struct pending_fd {
+    struct pending_fd *next;
+    int fd;
+} pending_fd_t;
+
 typedef struct {
     c_rule_t *rules;
     fs_list_t *fs_list;
     pid_cache_t *cache_idx;
     pid_cache_t pid_cache[PID_CACHE_SIZE];
+    pending_fd_t *pending_fds;
     long main_pid;
     int fano_fd;
     int log_fd;
@@ -440,6 +447,46 @@ PyDoc_STRVAR(create__doc__,
 "Raises:\n"
 "    OSError\n");
 
+static void
+pending_fd_add(fano_ctx_t *ctx, int fd)
+{
+    pending_fd_t *new = malloc(sizeof(*new));
+    if (!new)
+        return;
+    new->fd = fd;
+    new->next = ctx->pending_fds;
+    ctx->pending_fds = new;
+}
+
+static void
+pending_fd_remove(fano_ctx_t *ctx, int fd)
+{
+    pending_fd_t **current = &ctx->pending_fds;
+    while (*current) {
+        if ((*current)->fd == fd) {
+            pending_fd_t *to_remove = *current;
+            *current = (*current)->next;
+            close(fd);
+            free(to_remove);
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+static void
+pending_fd_clear(fano_ctx_t *ctx)
+{
+    pending_fd_t *current = ctx->pending_fds;
+    while (current) {
+        pending_fd_t *next = current->next;
+        close(current->fd);
+        free(current);
+        current = next;
+    }
+    ctx->pending_fds = NULL;
+}
+
 static PyObject *
 pyfanotify_create(PyObject *self, PyObject *args, PyObject *kwargs)
 {
@@ -450,6 +497,7 @@ pyfanotify_create(PyObject *self, PyObject *args, PyObject *kwargs)
     ctx->fano_fd = ctx->log_fd = ctx->sock_fd = -1;
     ctx->cache_idx = ctx->pid_cache;
     ctx->main_pid = getpid();
+    ctx->pending_fds = NULL;
 
     return PyLong_FromVoidPtr(ctx);
 }
@@ -588,8 +636,6 @@ send_permission_response(fano_ctx_t *ctx, struct fanotify_event_metadata *ev)
                     | FAN_OPEN_EXEC_PERM
 #endif
                    )) {
-        do_log(ctx, "PERMISSION_RESPONSE: Sending auto FAN_ALLOW response for permission event (fd=%d, mask=0x%llx)", 
-               ev->fd, (unsigned long long)ev->mask);
         
         struct fanotify_response response = {
             .fd = ev->fd,
@@ -601,9 +647,6 @@ send_permission_response(fano_ctx_t *ctx, struct fanotify_event_metadata *ev)
             do_log(ctx, "Failed to send FAN_ALLOW response for fd %d: %s", ev->fd, strerror(errno));
         } else if (ret != sizeof(response)) {
             do_log(ctx, "Partial write when sending FAN_ALLOW response for fd %d", ev->fd);
-        } else {
-            do_log(ctx, "Sent FAN_ALLOW response for skipped permission event (fd %d, mask 0x%llx)", 
-                   ev->fd, (unsigned long long)ev->mask);
         }
     }
 }
@@ -911,8 +954,10 @@ handle_events(fano_ctx_t *ctx)
 #ifdef FAN_OPEN_EXEC_PERM
                             | FAN_OPEN_EXEC_PERM
 #endif
-                           ))
+                           )) {
                 should_close_fd = 0;  // Don't close fd for permission events that match rules
+                pending_fd_add(ctx, ev->fd);  // Track this fd for later closure
+            }
         }
         
         // If no rules matched, send auto-response for permission events
@@ -1078,6 +1123,13 @@ pyfanotify_run(PyObject *self, PyObject *args, PyObject *kwargs)
                 break;
             case CMD_DISCONNECT:
                 rules_list_del(&ctx->rules, (void *)val);
+                break;
+            case CMD_CLOSE_FD:
+                if (val && PyLong_Check(val)) {
+                    int fd_to_close = (int)PyLong_AsLong(val);
+                    pending_fd_remove(ctx, fd_to_close);
+                }
+                break;
             default:
                 break;
             }
@@ -1112,6 +1164,7 @@ end:
     close(ctx->sock_fd);
     rules_list_clear(&ctx->rules);
     fs_list_clear(&ctx->fs_list);
+    pending_fd_clear(ctx);
     free(ctx);
     Py_XDECREF(fn);
     Py_XDECREF(fn_args);
@@ -1189,7 +1242,9 @@ pyfanotify_response(PyObject *self, PyObject *args, PyObject *kwargs)
                      ret, sizeof(fan_response));
         return NULL;
     }
-    close(event_fd);
+    
+    // Note: event_fd closure is now handled through IPC mechanism (CMD_CLOSE_FD)
+    // The calling code should send CMD_CLOSE_FD to notify handle_events to close the fd
     Py_RETURN_NONE;
 }
 
@@ -1265,6 +1320,7 @@ PyInit_ext(void)
     PyModule_AddIntMacro(module, CMD_STOP);
     PyModule_AddIntMacro(module, CMD_CONNECT);
     PyModule_AddIntMacro(module, CMD_DISCONNECT);
+    PyModule_AddIntMacro(module, CMD_CLOSE_FD);
 
 #ifdef FAN_ENABLE_AUDIT    // (Linux 4.15)
     PyModule_AddIntMacro(module, FAN_ENABLE_AUDIT);

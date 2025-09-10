@@ -80,6 +80,7 @@ O_CLOEXEC: int
 CMD_STOP: int
 CMD_CONNECT: int
 CMD_DISCONNECT: int
+CMD_CLOSE_FD: int
 
 
 def create() -> int:
