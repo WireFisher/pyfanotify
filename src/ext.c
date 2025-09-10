@@ -588,6 +588,9 @@ send_permission_response(fano_ctx_t *ctx, struct fanotify_event_metadata *ev)
                     | FAN_OPEN_EXEC_PERM
 #endif
                    )) {
+        do_log(ctx, "PERMISSION_RESPONSE: Sending auto FAN_ALLOW response for permission event (fd=%d, mask=0x%llx)", 
+               ev->fd, (unsigned long long)ev->mask);
+        
         struct fanotify_response response = {
             .fd = ev->fd,
             .response = FAN_ALLOW
@@ -692,20 +695,27 @@ handle_events(fano_ctx_t *ctx)
 
     if ((len = read(ctx->fano_fd, buf, sizeof(buf))) == -1) {
         ret = errno;
+        do_log(ctx, "ERROR: Failed to read from fanotify fd: %s", strerror(errno));
         goto end;
     }
 
     for (struct fanotify_event_metadata *ev = buf;
             FAN_EVENT_OK(ev, len);
-            close(ev->fd), ev = FAN_EVENT_NEXT(ev, len)){
+            ev = FAN_EVENT_NEXT(ev, len)){
+        int should_close_fd = 1;  // Flag to track whether to close fd
+        
         if (ev->vers != FANOTIFY_METADATA_VERSION) {
+            do_log(ctx, "ERROR: Fanotify metadata version mismatch - expected %d, got %d", 
+                   FANOTIFY_METADATA_VERSION, ev->vers);
             ret = FANO_MISMATCH_VER;
             goto end;
         }
 
         if (pid_cache_check(ctx, &bb, ev->pid)->our) {
             // skip ours - but send permission response if needed
+            //do_log(ctx, "SKIP: Event from our own process (pid=%d) - skipping", ev->pid);
             send_permission_response(ctx, ev);
+            close(ev->fd);
             continue;
         }
 
@@ -814,12 +824,14 @@ handle_events(fano_ctx_t *ctx)
         fid_end:
             if (cont) {
                 send_permission_response(ctx, ev);
+                close(ev->fd);
                 continue;
             }
         }
 # undef FAN_FLAGS
 #endif // FAN_REPORT_FID
 
+        int rule_matched = 0;  // Flag to track if any rule matched
         for (c_rule_t *rule = ctx->rules; rule; rule = rule->next) {
 
 # define RULE_MATCH(name, fmt, meta, i)     \
@@ -834,16 +846,18 @@ handle_events(fano_ctx_t *ctx)
                     || RULE_MATCH(cwd, "/proc/%ld/cwd", pid, 0)
                     || RULE_MATCH(path, "/proc/self/fd/%ld", fd, 0)
                     || RULE_MATCH(path, "/proc/self/fd/%ld", fd, 1)) {
-                send_permission_response(ctx, ev);
                 continue;
             }
 # undef RULE_MATCH
+
+            rule_matched = 1;  // At least one rule matched
 
             // sending data
             struct {
                 int64_t pid;
                 uint64_t ev_types;
-            } data = {ev->pid, ev->mask};
+                int32_t original_fd;
+            } data = {ev->pid, ev->mask, ev->fd};
             struct iovec iov[] = {
                     {&data, sizeof(data)},
                     {exe,  exe[0].len + sizeof(exe[0].len)},
@@ -872,16 +886,18 @@ handle_events(fano_ctx_t *ctx)
                 msg.msg_control = &cmsg;
                 msg.msg_controllen = sizeof(cmsg);
             }
-
+            
             for (int i = 0; i < 3; ++i) {
                 if (sendmsg(ctx->sock_fd, &msg, 0) < 0) {
                     if ((AGAIN && (usleep(250000) <= 0)) || errno == EINTR)
                         continue;
 
                     int e = errno;
-                    do_log(ctx, "FileMonitor: send_data error for %s: %s", rule->name.buf, strerror(e));
+                    do_log(ctx, "SEND_ERROR: send_data error for rule '%.*s': %s", 
+                           rule->name.buf, strerror(e));
                     if (e == ECONNREFUSED) {
-                        do_log(ctx, "FileMonitor: delete \"%s\"", rule->name.buf);
+                        do_log(ctx, "RULE_DELETE: Deleting rule '%.*s' due to connection refused", 
+                               (int)rule->name.len, rule->name.buf);
                         to_del.next = rule->next;
                         rules_list_raw_del(&ctx->rules, rule->hash);
                         rule = &to_del;
@@ -889,6 +905,22 @@ handle_events(fano_ctx_t *ctx)
                 }
                 break;
             }
+            
+            // For permission events that match rules, preserve the fd for upper application response
+            if (ev->mask & (FAN_OPEN_PERM | FAN_ACCESS_PERM
+#ifdef FAN_OPEN_EXEC_PERM
+                            | FAN_OPEN_EXEC_PERM
+#endif
+                           ))
+                should_close_fd = 0;  // Don't close fd for permission events that match rules
+        }
+        
+        // If no rules matched, send auto-response for permission events
+        if (!rule_matched) {
+            send_permission_response(ctx, ev);
+            close(ev->fd);
+        } else if (should_close_fd && ev->fd != FAN_NOFD) {
+            close(ev->fd);
         }
     }
 end:
@@ -1147,8 +1179,6 @@ pyfanotify_response(PyObject *self, PyObject *args, PyObject *kwargs)
         .response = response
     };
 
-    do_log(ctx, "DEBUG: response write to %d\n", fanotify_fd);
-
     // Send response to the fanotify file descriptor
     ssize_t ret = write(fanotify_fd, &fan_response, sizeof(fan_response));
     if (ret == -1) {
@@ -1159,7 +1189,7 @@ pyfanotify_response(PyObject *self, PyObject *args, PyObject *kwargs)
                      ret, sizeof(fan_response));
         return NULL;
     }
-
+    close(event_fd);
     Py_RETURN_NONE;
 }
 

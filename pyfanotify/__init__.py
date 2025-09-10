@@ -14,7 +14,7 @@ import socket
 import struct
 import sys
 
-from typing import Any, Callable, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Tuple, Union, Generator
 
 from . import ext
 
@@ -417,18 +417,19 @@ class FanotifyData(dict):
     Contains fanotify event information
     """
 
-    def __init__(self, fd: int = -1, pid: int = 0, ev_types: int = 0,
+    def __init__(self, fd: int = -1, pid: int = 0, ev_types: int = 0, original_fd: int = -1,
                  exe: str = None, cwd: str = None, path: Tuple[str] = ()):
         """
         :param fd: File descriptor if passed
         :param pid: PID of caused process
         :param ev_types: Event types of fanotify event
+        :param original_fd: Original file descriptor from the sender
         :param exe: EXE of the event caused process if passed
         :param cwd: CWD of the event caused process if passed
         :param path: tuple of PATH of the event caused file if passed
         """
 
-        super().__init__(fd=fd, pid=pid, ev_types=ev_types, exe=exe, cwd=cwd, path=path)
+        super().__init__(fd=fd, pid=pid, ev_types=ev_types, original_fd=original_fd, exe=exe, cwd=cwd, path=path)
 
     def __getattr__(self, name: str) -> Any:
         return self[name]
@@ -445,7 +446,7 @@ class FanotifyClient:
     Client for easy use and getting data via Fanotify.
     """
 
-    _PID_EVT_S = struct.Struct('=qQ')
+    _PID_EVT_ORIG_FD_S = struct.Struct('=qQi')
     _P_SZ_S = struct.Struct('=I')
 
     def __init__(self, fanotify: Fanotify, **rkw) -> None:
@@ -477,7 +478,7 @@ class FanotifyClient:
         self.fanotify.disconnect(self.rule)
         self.sock.close()
 
-    def get_events(self) -> FanotifyData:
+    def get_events(self) -> Generator[FanotifyData, None, None]:
         """
         Receive fanotify events according to the established rules
         for the current client.
@@ -502,8 +503,8 @@ class FanotifyClient:
                 fds = array.array('i')
                 fds.frombytes(fd)
                 res.fd = fds[0]
-        res.pid, res.ev_types = self._PID_EVT_S.unpack_from(msg, 0)
-        off = self._PID_EVT_S.size
+        res.pid, res.ev_types, res.original_fd = self._PID_EVT_ORIG_FD_S.unpack_from(msg, 0)
+        off = self._PID_EVT_ORIG_FD_S.size
         for i in 'exe', 'cwd':
             sz, = self._P_SZ_S.unpack_from(msg, off)
             off += self._P_SZ_S.size

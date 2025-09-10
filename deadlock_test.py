@@ -72,10 +72,11 @@ def test_separate_process_approach():
                         print(f"✓ Received permission event: {fan.evt_to_str(event.ev_types)}")
                         print(f"  PID: {event.pid}")
                         print(f"  FD: {event.fd}")
+                        print(f"  Original FD: {event.original_fd}")
                         print(f"  File path: {get_filename_from_fd(event.fd)}")
                         # Auto-allow all events
                         if event.ev_types & fan.FAN_ALL_PERM_EVENTS:
-                            cli.response(event.fd, fan.FAN_ALLOW)
+                            cli.response(event.original_fd, fan.FAN_ALLOW)
             
             cli.close()
             fanot.stop()
