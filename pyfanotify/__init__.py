@@ -519,17 +519,38 @@ class FanotifyClient:
                 fds = array.array('i')
                 fds.frombytes(fd)
                 res.fd = fds[0]
+        
+        # Check if we have enough data for the initial struct
+        if len(msg) < self._PID_EVT_ORIG_FD_S.size:
+            return res
+            
         res.pid, res.ev_types, res.original_fd = self._PID_EVT_ORIG_FD_S.unpack_from(msg, 0)
         off = self._PID_EVT_ORIG_FD_S.size
+        
         for i in 'exe', 'cwd':
+            # Check if we have enough data for the size field
+            if off + self._P_SZ_S.size > len(msg):
+                break
             sz, = self._P_SZ_S.unpack_from(msg, off)
             off += self._P_SZ_S.size
+            
+            # Check if we have enough data for the actual content
+            if off + sz > len(msg):
+                break
             res[i] = msg[off:off + sz]
             off += sz
+            
         p = []
-        while len(msg) - off:
+        while off < len(msg):
+            # Check if we have enough data for the size field
+            if off + self._P_SZ_S.size > len(msg):
+                break
             sz, = self._P_SZ_S.unpack_from(msg, off)
             off += self._P_SZ_S.size
+            
+            # Check if we have enough data for the actual content
+            if off + sz > len(msg):
+                break
             p.append(msg[off:off + sz])
             off += sz
         res['path'] = tuple(p)
